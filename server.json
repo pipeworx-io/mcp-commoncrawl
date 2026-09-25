@@ -3,7 +3,7 @@
   "name": "io.github.pipeworx-io/commoncrawl",
   "title": "Commoncrawl",
   "description": "Common Crawl's public web archive — find every time a URL was crawled since 2008 and read the…",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "websiteUrl": "https://pipeworx.io/packs/commoncrawl",
   "repository": {
     "url": "https://github.com/pipeworx-io/mcp-commoncrawl",
