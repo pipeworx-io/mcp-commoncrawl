@@ -912,6 +912,17 @@ async function handleIndexSearch(args: Record<string, unknown>): Promise<unknown
       captures: [],
       count: 0,
       note: `No captures of "${url}" in ${crawl}. Try another crawl from commoncrawl_crawls, or a broader match_type such as "domain".`,
+      // Domain/host-wide queries on large sites are the CDX's most expensive
+      // shape: the same query flips between a 200 with no rows and a 504 within
+      // seconds (bbc.co.uk domain-wide, measured 2026-10-04, both live and by
+      // direct curl). A zero there is not evidence of absence.
+      ...(/^(domain|host)$/i.test(String(args.match_type ?? ''))
+        ? {
+            caveat:
+              `A ${String(args.match_type)}-wide lookup is the index's most expensive query and it sometimes returns nothing under load instead of an error, so this zero may mean "the index gave up", not "never crawled". ` +
+              `Retry once, or query a specific URL with match_type "exact" / "prefix", which answers reliably.`,
+          }
+        : {}),
     };
   }
   if (!res.ok) {
