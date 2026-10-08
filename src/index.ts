@@ -1078,6 +1078,74 @@ function splitWarcRecord(raw: string): { warcHeaders: Record<string, string>; ht
   return { warcHeaders, httpStatusLine, httpHeaders, body };
 }
 
+/**
+ * Read one WARC record by byte range and split it into WARC headers, HTTP
+ * status/headers and the FULL body. Exported (not an MCP tool) so the
+ * gateway's archive_evidence compound (fleet #2820) reads records through
+ * this pack's client — the 206 check, the retry shape — instead of a second
+ * one, and gets the whole page rather than the tool's 200 KB response cap
+ * (an ftc.gov page carries >200 KB of inline SVG before its first paragraph).
+ */
+export async function readWarcRecord(
+  filename: string,
+  offset: number,
+  length: number,
+): Promise<{
+  recordUrl: string;
+  decompressedBytes: number;
+  warcHeaders: Record<string, string>;
+  httpStatusLine: string | null;
+  httpHeaders: Record<string, string>;
+  body: string;
+}> {
+  if (!filename || filename.includes('..') || filename.startsWith('/') || filename.includes('://')) {
+    throw new Error('`filename` must be a WARC path relative to data.commoncrawl.org, e.g. "crawl-data/CC-MAIN-.../*.warc.gz".');
+  }
+  if (!Number.isSafeInteger(offset) || offset < 0 || !Number.isSafeInteger(length) || length < 1 || length > 10_485_760) {
+    throw new Error('`offset` and `length` must come from the same capture row as `filename` (length at most 10485760).');
+  }
+  const recordUrl = `${DATA_BASE}/${filename}`;
+  // A byte-range GET of a fixed-size record, not a sharded scan — same
+  // reasoning as collinfo.json above (fleet #2798): FAST_TIMEOUT_MS is still
+  // generous headroom for attempt 0, and tightens this call site's retries.
+  //
+  // Only a 206 is the record. Fleet #2820, measured from a Cloudflare Worker
+  // 2026-10-08: data.commoncrawl.org occasionally IGNORES the Range header and
+  // answers 200 with the whole ~1.2 GB WARC file (the next three identical
+  // requests got 206 / 25,159 bytes). This used to accept a 200, gunzip the
+  // file's FIRST member — some other page entirely — and die on "Trailing
+  // bytes after end of compressed data" (or the isolate's memory limit). So a
+  // 200 is cancelled unread and the read retried; if the store keeps ignoring
+  // the range, the error says so instead of blaming gzip.
+  let res: Response | undefined;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    res = await ccFetch(recordUrl, { headers: { Range: `bytes=${offset}-${offset + length - 1}` } }, FAST_TIMEOUT_MS);
+    if (res.status !== 200) break;
+    await res.body?.cancel().catch(() => undefined);
+  }
+  if (!res || res.status === 200) {
+    throw new Error(
+      `Common Crawl data store ignored the byte range for ${filename} three times (HTTP 200 with the whole file instead of 206 with the record). Retry shortly.`,
+    );
+  }
+  if (res.status !== 206) {
+    throw new Error(
+      `Common Crawl data store returned HTTP ${res.status} for a range read of ${filename}. ` +
+        'Check that filename/offset/length came from the same capture row.',
+    );
+  }
+  if (!res.body) throw new Error('Common Crawl data store returned an empty body for that byte range.');
+
+  // Each indexed record is its own gzip member, so the range read decompresses
+  // on its own. DecompressionStream is available in the Workers runtime.
+  const stream = res.body.pipeThrough(new DecompressionStream('gzip'));
+  const decompressed = new Uint8Array(await new Response(stream).arrayBuffer());
+  const raw = new TextDecoder('utf-8').decode(decompressed);
+
+  const { warcHeaders, httpStatusLine, httpHeaders, body } = splitWarcRecord(raw);
+  return { recordUrl, decompressedBytes: decompressed.length, warcHeaders, httpStatusLine, httpHeaders, body };
+}
+
 async function handleFetchRecord(args: Record<string, unknown>): Promise<unknown> {
   const filename = typeof args.filename === 'string' ? args.filename.trim() : '';
   if (!filename) {
@@ -1093,26 +1161,7 @@ async function handleFetchRecord(args: Record<string, unknown>): Promise<unknown
   }
   const maxBody = clamp(args.max_body_bytes, 20_000, 500, 200_000);
 
-  const recordUrl = `${DATA_BASE}/${filename}`;
-  // A byte-range GET of a fixed-size record, not a sharded scan — same
-  // reasoning as collinfo.json above (fleet #2798): FAST_TIMEOUT_MS is still
-  // generous headroom for attempt 0, and tightens this call site's retries.
-  const res = await ccFetch(recordUrl, { headers: { Range: `bytes=${offset}-${offset + length - 1}` } }, FAST_TIMEOUT_MS);
-  if (res.status !== 206 && res.status !== 200) {
-    throw new Error(
-      `Common Crawl data store returned HTTP ${res.status} for a range read of ${filename}. ` +
-        'Check that filename/offset/length came from the same capture row.',
-    );
-  }
-  if (!res.body) throw new Error('Common Crawl data store returned an empty body for that byte range.');
-
-  // Each indexed record is its own gzip member, so the range read decompresses
-  // on its own. DecompressionStream is available in the Workers runtime.
-  const stream = res.body.pipeThrough(new DecompressionStream('gzip'));
-  const decompressed = new Uint8Array(await new Response(stream).arrayBuffer());
-  const raw = new TextDecoder('utf-8').decode(decompressed);
-
-  const { warcHeaders, httpStatusLine, httpHeaders, body } = splitWarcRecord(raw);
+  const { recordUrl, decompressedBytes, warcHeaders, httpStatusLine, httpHeaders, body } = await readWarcRecord(filename, offset, length);
   const bodyBytes = new TextEncoder().encode(body).length;
   const truncated = bodyBytes > maxBody;
 
@@ -1120,7 +1169,7 @@ async function handleFetchRecord(args: Record<string, unknown>): Promise<unknown
     source: 'Common Crawl Foundation — data.commoncrawl.org (WARC)',
     warc_url: recordUrl,
     byte_range: { offset, length },
-    record_bytes_decompressed: decompressed.length,
+    record_bytes_decompressed: decompressedBytes,
     target_uri: warcHeaders['WARC-Target-URI'] ?? null,
     warc_type: warcHeaders['WARC-Type'] ?? null,
     warc_date: warcHeaders['WARC-Date'] ?? null,
