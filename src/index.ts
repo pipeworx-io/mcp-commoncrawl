@@ -696,12 +696,54 @@ const UA = 'pipeworx-mcp-commoncrawl/1.0 (+https://pipeworx.io)';
 // minute, so it is load, not the query. Retry a 5xx twice before surfacing it;
 // without this a caller reads transient nginx noise as "Common Crawl has no
 // record of this URL", which is a different and wrong answer.
-async function ccFetch(url: string | URL, init: RequestInit = {}, timeoutMs = 45_000): Promise<Response> {
+//
+// FLEET #2798 (2026-10-07) — the ORIGINAL attempt here gave every retry the
+// same 45s bound as attempt 0, which is the wrong model: attempt 0 can
+// legitimately need up to 45s (a real large domain/host scan), but attempts 1
+// and 2 only exist to ride out the documented 200/502 flap, and a flap answers
+// (either way) in a few seconds, not tens of seconds — it already returned a
+// response (a 502), it did not time out. Giving a RETRY up to 45s to discover
+// a second 502 is what turned a flaky run into AE's measured p95 ~32s / max
+// 38.8s, and a genuinely-down shard into ~90s+ (clipped by the gateway's own
+// 75s DEFAULT_BUDGET_MS, which matches the observed upstream_down max of
+// 34.8s rather than something nearer the 136.25s three-attempts-at-45s
+// theoretical ceiling). Live reproduction today, three further cold calls on
+// a guaranteed-unindexed URL: total_ms 14673 (2 retries fired), 1957 (1
+// retry), 6924 (1 retry) — every completed attempt, including the ones that
+// got a 502, answered in low single-digit seconds. So retries are capped at
+// RETRY_TIMEOUT_MS instead of the caller's timeoutMs: attempt 0 keeps
+// whatever bound the caller asked for (unchanged default 45s), attempts 1-2
+// bail at 8s. Worst case for the search path (the only call site that still
+// passes the generous 45s) drops from 136.25s theoretical to 45+750+8+1500+8
+// = 63.25s; the two fast call sites (collinfo.json, the WARC byte-range read)
+// were already passing the 45s default despite answering in well under a
+// second in every sample taken, so their worst case drops from the same
+// 136.25s to 20+750+8+1500+8 = 38.25s once their own call sites are tightened
+// below.
+const RETRY_TIMEOUT_MS = 8_000;
+
+/** What ccFetch actually did, so a caller can tell a clean first try apart
+ * from an answer that only arrived after absorbing upstream flakiness —
+ * fleet #2798's "make the empty class honest" ask. Exported shape kept
+ * minimal: attempts made and how many of those were an absorbed 5xx. */
+type RetryTrace = { attempts: number; five_xx_absorbed: number };
+
+async function ccFetch(
+  url: string | URL,
+  init: RequestInit = {},
+  timeoutMs = 45_000,
+  trace?: RetryTrace,
+): Promise<Response> {
   const headers = { 'User-Agent': UA, ...(init.headers ?? {}) };
   let last: Response | undefined;
   for (let attempt = 0; attempt < 3; attempt++) {
     if (attempt > 0) await new Promise((r) => setTimeout(r, 750 * attempt));
-    last = await fetchWithTimeout(url, { ...init, headers }, 'Common Crawl', timeoutMs);
+    const boundMs = attempt === 0 ? timeoutMs : Math.min(timeoutMs, RETRY_TIMEOUT_MS);
+    last = await fetchWithTimeout(url, { ...init, headers }, 'Common Crawl', boundMs);
+    if (trace) {
+      trace.attempts++;
+      if (last.status >= 500) trace.five_xx_absorbed++;
+    }
     if (last.status < 500) return last;
   }
   return last as Response;
@@ -719,8 +761,14 @@ type CollInfo = {
 /** Capture row as the CDX index emits it (JSON-lines, all values strings). */
 type CdxRow = Record<string, string>;
 
+// collinfo.json is a small, fixed-shape listing, not a sharded domain scan —
+// every sample taken for fleet #2798 answered in well under a second. It
+// never needed the 45s domain-scan allowance; 20s is still generous headroom
+// for attempt 0 and tightens the worst case for this call site's own retries.
+const FAST_TIMEOUT_MS = 20_000;
+
 async function listCrawls(): Promise<CollInfo[]> {
-  const res = await ccFetch(`${INDEX_BASE}/collinfo.json`);
+  const res = await ccFetch(`${INDEX_BASE}/collinfo.json`, {}, FAST_TIMEOUT_MS);
   if (!res.ok) {
     throw new Error(
       `Common Crawl collinfo returned HTTP ${res.status}. The crawl list lives at ${INDEX_BASE}/collinfo.json; retry shortly.`,
@@ -897,8 +945,17 @@ async function handleIndexSearch(args: Record<string, unknown>): Promise<unknown
   if (typeof args.to === 'string' && args.to) qs.set('to', args.to);
 
   const endpoint = `${INDEX_BASE}/${crawl}-index?${qs.toString()}`;
-  const res = await ccFetch(endpoint);
+  // fleet #2798 — "make the 70% empty class honest": a caller reading a bare
+  // `captures:[]` cannot tell "the index confirmed nothing on the first ask"
+  // from "two 502s were absorbed before a confirmed empty came back", and
+  // the AE evidence for this task shows that distinction is exactly what was
+  // missing. `trace` is attached below to BOTH the empty and the success
+  // shapes so the field is always present, not conditional on whether a
+  // retry happened to fire.
+  const trace: RetryTrace = { attempts: 0, five_xx_absorbed: 0 };
+  const res = await ccFetch(endpoint, {}, 45_000, trace);
   const text = await res.text();
+  const retries = { attempts: trace.attempts, five_xx_absorbed: trace.five_xx_absorbed };
 
   // The CDX index answers "nothing matched" with a 404 and a plain-English
   // sentence, not JSON — report that as an empty result set rather than an
@@ -911,6 +968,7 @@ async function handleIndexSearch(args: Record<string, unknown>): Promise<unknown
       query: { url, match_type: args.match_type ?? 'exact', filter: args.filter ?? null },
       captures: [],
       count: 0,
+      empty_reason: 'no_match',
       note: `No captures of "${url}" in ${crawl}. Try another crawl from commoncrawl_crawls, or a broader match_type such as "domain".`,
       // Domain/host-wide queries on large sites are the CDX's most expensive
       // shape: the same query flips between a 200 with no rows and a 504 within
@@ -923,11 +981,19 @@ async function handleIndexSearch(args: Record<string, unknown>): Promise<unknown
               `Retry once, or query a specific URL with match_type "exact" / "prefix", which answers reliably.`,
           }
         : {}),
+      // How we got here — fleet #2798. attempts=1, five_xx_absorbed=0 means
+      // the index answered "no captures" cleanly on the first try. A higher
+      // five_xx_absorbed means this confirmed-empty answer only arrived after
+      // riding out upstream 502 flakiness, which is useful context for
+      // anyone debugging the empty rate even though the "no captures" answer
+      // itself is unaffected by how many 502s preceded it.
+      retries,
     };
   }
   if (!res.ok) {
     throw new Error(
-      `Common Crawl CDX index returned HTTP ${res.status} for ${crawl}. ${summarizeErrorBody(text)}`.trim(),
+      `Common Crawl CDX index returned HTTP ${res.status} for ${crawl} after ${retries.attempts} attempt(s) ` +
+        `(${retries.five_xx_absorbed} were 5xx). ${summarizeErrorBody(text)}`.trim(),
     );
   }
 
@@ -977,6 +1043,7 @@ async function handleIndexSearch(args: Record<string, unknown>): Promise<unknown
     next_page: captures.length === limit ? page + 1 : null,
     fetch_hint:
       'Pass a capture\'s filename + offset + length to commoncrawl_fetch_record to read the archived page body.',
+    retries,
   };
 }
 
@@ -1027,7 +1094,10 @@ async function handleFetchRecord(args: Record<string, unknown>): Promise<unknown
   const maxBody = clamp(args.max_body_bytes, 20_000, 500, 200_000);
 
   const recordUrl = `${DATA_BASE}/${filename}`;
-  const res = await ccFetch(recordUrl, { headers: { Range: `bytes=${offset}-${offset + length - 1}` } });
+  // A byte-range GET of a fixed-size record, not a sharded scan — same
+  // reasoning as collinfo.json above (fleet #2798): FAST_TIMEOUT_MS is still
+  // generous headroom for attempt 0, and tightens this call site's retries.
+  const res = await ccFetch(recordUrl, { headers: { Range: `bytes=${offset}-${offset + length - 1}` } }, FAST_TIMEOUT_MS);
   if (res.status !== 206 && res.status !== 200) {
     throw new Error(
       `Common Crawl data store returned HTTP ${res.status} for a range read of ${filename}. ` +
