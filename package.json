@@ -1,6 +1,6 @@
 {
   "name": "@pipeworx/mcp-commoncrawl",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "Common Crawl's public web archive — find every time a URL was crawled since 2008 and read the exact page bytes that were captured.",
   "type": "module",
   "main": "src/index.ts",
@@ -26,7 +26,7 @@
     "@cloudflare/workers-types": "^4.20260405.1"
   },
   "pipeworx": {
-    "sourceHash": "v1-bff7e9bb9b9b7bf26d4370286593932844e780375724de26338b265761cd0960",
-    "sourceCommit": "e369dfedd93d5fcbf521281559a146302c14e1a0"
+    "sourceHash": "v1-e16cfcb47d3896f6b384cac58c574bf8c76b83656d5c56b143f2357030a9e6c8",
+    "sourceCommit": "b0a4b8e2f3f5b3a4c3f9f2c9a73f91b20d32ce11"
   }
 }
