@@ -1,12 +1,20 @@
 {
   "name": "@pipeworx/mcp-commoncrawl",
-  "version": "0.1.6",
+  "version": "0.2.0",
   "description": "Common Crawl's public web archive — find every time a URL was crawled since 2008 and read the exact page bytes that were captured.",
   "type": "module",
-  "main": "src/index.ts",
-  "types": "src/index.ts",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./tools.json": "./tools.json",
+    "./package.json": "./package.json"
+  },
   "bin": {
     "mcp-commoncrawl": "bin/cli.js"
+  },
+  "files": ["bin/", "lib/", "tools.json", "server.json"],
+  "engines": {
+    "node": ">=18"
   },
   "keywords": ["mcp", "mcp-server", "model-context-protocol", "pipeworx", "commoncrawl"],
   "license": "MIT",
@@ -14,19 +22,12 @@
     "type": "git",
     "url": "git+https://github.com/pipeworx-io/mcp-commoncrawl.git"
   },
-  "scripts": {
-    "typecheck": "tsc --noEmit"
-  },
-  "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.30.0",
-    "tsx": "^4.19.0"
-  },
-  "devDependencies": {
-    "typescript": "^5.9.3",
-    "@cloudflare/workers-types": "^4.20260405.1"
-  },
+  "mcpName": "io.github.pipeworx-io/commoncrawl",
   "pipeworx": {
-    "sourceHash": "v1-50a8dc2c6ac7f22add874a82cfab4b47f30bd59ba9b142891ba5a6631fd27953",
-    "sourceCommit": "f1ef7a2f6b9cb1b8da1374ec2fcb28c661582b35"
+    "mode": "gateway",
+    "slug": "commoncrawl",
+    "gatewaySlug": "commoncrawl",
+    "sourceHash": "v1-1cb5aa51804a6d2bcf86820b2ef52216340aea30b37af273abf30ac3a39b2324",
+    "sourceCommit": "4277282d72f9bf55e548b3799aaf737baf22152f"
   }
 }
