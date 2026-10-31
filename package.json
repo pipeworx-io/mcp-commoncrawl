@@ -1,6 +1,6 @@
 {
   "name": "@pipeworx/mcp-commoncrawl",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Common Crawl's public web archive — find every time a URL was crawled since 2008 and read the exact page bytes that were captured.",
   "type": "module",
   "main": "lib/index.js",
@@ -27,7 +27,7 @@
     "mode": "gateway",
     "slug": "commoncrawl",
     "gatewaySlug": "commoncrawl",
-    "sourceHash": "v1-1cb5aa51804a6d2bcf86820b2ef52216340aea30b37af273abf30ac3a39b2324",
-    "sourceCommit": "4277282d72f9bf55e548b3799aaf737baf22152f"
+    "sourceHash": "v1-123ca73ca505f82d8e5d5f58131be0498b812ec32dfbe6e7a4929f884705f0a6",
+    "sourceCommit": "8cc978183948532674e797c429305c9d8ab2a1c3"
   }
 }
